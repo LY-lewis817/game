@@ -1,4 +1,5 @@
 const MAX_QUESTIONS = 100;
+const SESSION_QUESTIONS = 20;
 const RECENT_DISTRACTOR_WINDOW = 12;
 const RECENT_CHOICESET_WINDOW = 24;
 const RECENT_CHOICES_WINDOW = 48;
@@ -194,6 +195,7 @@ const posSummaryEl = document.getElementById("posSummary");
 const nextBtn = document.getElementById("nextBtn");
 const resetBtn = document.getElementById("resetBtn");
 const savedReviewBtn = document.getElementById("savedReviewBtn");
+const continueBtn = document.getElementById("continueBtn");
 const playAudioBtn = document.getElementById("playAudioBtn");
 const audioControlsEl = document.getElementById("audioControls");
 
@@ -206,6 +208,8 @@ let answered = false;
 let listeningCount = 0;
 let contextCount = 0;
 let totalQuestions = 0;
+let sessionStartIndex = 0;
+let sessionResults = [];
 let usedDistractors = [];
 let recentChoices = [];
 let usedChoiceSets = [];
@@ -213,6 +217,9 @@ let missedWords = [];
 let reviewMisses = [];
 let isReviewMode = false;
 let reviewRound = 0;
+let pendingReviewWords = [];
+let pendingReviewReturnMode = "restart";
+let pausedMainState = null;
 
 const shuffle = (arr) => [...arr].sort(() => Math.random() - 0.5);
 
@@ -242,6 +249,22 @@ function uniqueWords(items) {
     seen.add(key);
     return true;
   });
+}
+
+function getSessionEndIndex() {
+  return Math.min(sessionStartIndex + SESSION_QUESTIONS, totalQuestions);
+}
+
+function getSessionTotal() {
+  return getSessionEndIndex() - sessionStartIndex;
+}
+
+function getSessionNumber() {
+  return Math.floor(sessionStartIndex / SESSION_QUESTIONS) + 1;
+}
+
+function getSessionProgress() {
+  return Math.min(questionNumber - sessionStartIndex + 1, getSessionTotal());
 }
 
 function getStoredWeakWordKeys() {
@@ -297,6 +320,20 @@ function updateSavedReviewButton() {
   const count = getSavedWeakWords().length;
   savedReviewBtn.hidden = isReviewMode || count === 0;
   savedReviewBtn.textContent = count > 0 ? `保存した苦手語を復習 (${count})` : "保存した苦手語を復習";
+}
+
+function setContinueButton(label, action) {
+  if (!continueBtn) return;
+
+  if (!action) {
+    continueBtn.hidden = true;
+    continueBtn.dataset.action = "";
+    return;
+  }
+
+  continueBtn.hidden = false;
+  continueBtn.textContent = label;
+  continueBtn.dataset.action = action;
 }
 
 function rememberMiss(word) {
@@ -370,6 +407,8 @@ function initGame() {
   answered = false;
   listeningCount = 0;
   contextCount = 0;
+  sessionStartIndex = 0;
+  sessionResults = [];
   usedDistractors = [];
   recentChoices = [];
   usedChoiceSets = [];
@@ -377,8 +416,12 @@ function initGame() {
   reviewMisses = [];
   isReviewMode = false;
   reviewRound = 0;
+  pendingReviewWords = [];
+  pendingReviewReturnMode = "restart";
+  pausedMainState = null;
   nextBtn.dataset.action = "next";
   nextBtn.textContent = "次の問題";
+  setContinueButton("", "");
   messageEl.textContent = "";
   messageEl.className = "message";
   renderPosSummary();
@@ -388,8 +431,15 @@ function initGame() {
 }
 
 function updateStatus() {
-  const label = isReviewMode ? `復習${reviewRound}` : "問題";
-  progressEl.textContent = `${label}: ${Math.min(questionNumber + 1, totalQuestions)} / ${totalQuestions}`;
+  const displayOffset = answered ? 0 : 1;
+
+  if (isReviewMode) {
+    progressEl.textContent = `復習${reviewRound}: ${Math.min(questionNumber + displayOffset, totalQuestions)} / ${totalQuestions}`;
+  } else {
+    const sessionProgress = Math.min(questionNumber - sessionStartIndex + displayOffset, getSessionTotal());
+    const totalProgress = Math.min(questionNumber + displayOffset, totalQuestions);
+    progressEl.textContent = `セット${getSessionNumber()}: ${sessionProgress} / ${getSessionTotal()}（全体 ${totalProgress} / ${totalQuestions}）`;
+  }
   scoreEl.textContent = `スコア: ${score}`;
   streakEl.textContent = `連続正解: ${streak}`;
   modeCountEl.textContent = `聞き取り: ${listeningCount}問 / 文脈: ${contextCount}問`;
@@ -423,30 +473,152 @@ function renderReviewSummary(items) {
   optionsEl.appendChild(list);
 }
 
-function finishMainRound() {
-  const misses = uniqueWords(missedWords);
-  promptEl.textContent = "おつかれさま。ぜんもん しゅうりょう。";
+function renderSessionReflection(results) {
+  optionsEl.innerHTML = "";
+
+  const list = document.createElement("div");
+  list.className = "review-list reflection-list";
+
+  const title = document.createElement("h2");
+  title.textContent = "今回の振り返り";
+  list.appendChild(title);
+
+  results.forEach((result, index) => {
+    const item = document.createElement("div");
+    item.className = `review-item reflection-item ${result.correct ? "is-correct" : "is-wrong"}`;
+    item.textContent = `${index + 1}. ${result.correct ? "○" : "×"} ${result.word.kana}（${result.word.jp}） - ${result.word.zh} / ${QUIZ_TYPES[result.quizType]}`;
+    list.appendChild(item);
+  });
+
+  optionsEl.appendChild(list);
+}
+
+function finishSessionRound() {
+  const sessionTotal = sessionResults.length;
+  const correctCount = sessionResults.filter((result) => result.correct).length;
+  const misses = uniqueWords(sessionResults.filter((result) => !result.correct).map((result) => result.word));
+  const isFinalSession = questionNumber >= totalQuestions;
+
+  pendingReviewWords = misses;
+  pendingReviewReturnMode = isFinalSession ? "restart" : "continue-main";
+
+  promptEl.textContent = isFinalSession
+    ? "全セット終了。ここで振り返りましょう。"
+    : "20問終了。いったんここで振り返りましょう。";
   audioControlsEl.style.display = "none";
-  modeLabelEl.textContent = "モード: 終了";
-  progressEl.textContent = `問題: ${totalQuestions} / ${totalQuestions}`;
+  modeLabelEl.textContent = "モード: 振り返り";
+  progressEl.textContent = `セット${getSessionNumber()}: ${sessionTotal} / ${sessionTotal}（全体 ${questionNumber} / ${totalQuestions}）`;
+  messageEl.textContent = `今回のスコア: ${score} / ${sessionTotal * 10}。正解: ${correctCount} / ${sessionTotal}。間違えた語: ${misses.length}語`;
+  messageEl.className = misses.length > 0 ? "message ng" : "message ok";
+  renderSessionReflection(sessionResults);
 
   if (misses.length > 0) {
-    messageEl.textContent = `さいしゅうすこあ: ${score} / ${totalQuestions * 10}。間違えた語: ${misses.length}語`;
     nextBtn.textContent = "間違えた語だけ復習";
-    nextBtn.dataset.action = "review";
-    renderReviewSummary(misses);
+    nextBtn.dataset.action = "review-pending";
+    setContinueButton(isFinalSession ? "もう一度プレイ" : "続きの20問へ", isFinalSession ? "restart" : "continue-session");
   } else {
-    messageEl.textContent = `さいしゅうすこあ: ${score} / ${totalQuestions * 10}。全問正解です！`;
-    nextBtn.textContent = "もう一度プレイ";
-    nextBtn.dataset.action = "restart";
-    optionsEl.innerHTML = "";
+    nextBtn.textContent = isFinalSession ? "もう一度プレイ" : "続きの20問へ";
+    nextBtn.dataset.action = isFinalSession ? "restart" : "continue-session";
+    setContinueButton("", "");
+  }
+}
+
+function captureMainState() {
+  return {
+    deck: [...deck],
+    current,
+    questionNumber,
+    score,
+    streak,
+    answered,
+    listeningCount,
+    contextCount,
+    totalQuestions,
+    sessionStartIndex,
+    sessionResults: [...sessionResults],
+    usedDistractors: [...usedDistractors],
+    recentChoices: [...recentChoices],
+    usedChoiceSets: [...usedChoiceSets],
+    missedWords: [...missedWords],
+  };
+}
+
+function restoreMainState() {
+  if (!pausedMainState) return false;
+
+  deck = [...pausedMainState.deck];
+  current = pausedMainState.current;
+  questionNumber = pausedMainState.questionNumber;
+  score = pausedMainState.score;
+  streak = pausedMainState.streak;
+  answered = pausedMainState.answered;
+  listeningCount = pausedMainState.listeningCount;
+  contextCount = pausedMainState.contextCount;
+  totalQuestions = pausedMainState.totalQuestions;
+  sessionStartIndex = pausedMainState.sessionStartIndex;
+  sessionResults = [...pausedMainState.sessionResults];
+  usedDistractors = [...pausedMainState.usedDistractors];
+  recentChoices = [...pausedMainState.recentChoices];
+  usedChoiceSets = [...pausedMainState.usedChoiceSets];
+  missedWords = [...pausedMainState.missedWords];
+  pausedMainState = null;
+  isReviewMode = false;
+  reviewMisses = [];
+  return true;
+}
+
+function startNextSession() {
+  if (questionNumber >= totalQuestions) {
+    initGame();
+    return;
   }
 
-  messageEl.className = "message ok";
+  sessionStartIndex = questionNumber;
+  sessionResults = [];
+  score = 0;
+  streak = 0;
+  answered = false;
+  listeningCount = 0;
+  contextCount = 0;
+  nextBtn.dataset.action = "next";
+  nextBtn.textContent = "次の問題";
+  setContinueButton("", "");
+  messageEl.textContent = "";
+  messageEl.className = "message";
+  updateSavedReviewButton();
+  updateStatus();
+  loadQuestion();
+}
+
+function returnFromReview() {
+  const returnMode = pendingReviewReturnMode;
+
+  if (!restoreMainState()) {
+    initGame();
+    return;
+  }
+
+  pendingReviewWords = [];
+  pendingReviewReturnMode = "restart";
+  reviewRound = 0;
+
+  if (returnMode === "continue-main") {
+    startNextSession();
+    return;
+  }
+
+  setContinueButton("", "");
+  updateSavedReviewButton();
+  updateStatus();
+  loadQuestion();
 }
 
 function finishReviewRound() {
   const misses = uniqueWords(reviewMisses);
+  const hasReturnTarget = Boolean(pausedMainState) && pendingReviewReturnMode !== "restart";
+  const returnLabel = pendingReviewReturnMode === "continue-main" ? "続きの20問へ" : "元のゲームへ";
+  const returnAction = hasReturnTarget ? "return-review" : "restart";
+
   promptEl.textContent =
     misses.length > 0
       ? "復習ラウンド終了。まだ苦手な語をもう一度練習できます。"
@@ -459,24 +631,31 @@ function finishReviewRound() {
     messageEl.textContent = `復習スコア: ${score} / ${totalQuestions * 10}。もう一度: ${misses.length}語`;
     nextBtn.textContent = "もう一度復習";
     nextBtn.dataset.action = "review-again";
+    setContinueButton(hasReturnTarget ? returnLabel : "通常ゲームへ", returnAction);
     renderReviewSummary(misses);
   } else {
     messageEl.textContent = `復習スコア: ${score} / ${totalQuestions * 10}`;
-    nextBtn.textContent = "通常ゲームへ";
-    nextBtn.dataset.action = "restart";
+    nextBtn.textContent = hasReturnTarget ? returnLabel : "通常ゲームへ";
+    nextBtn.dataset.action = returnAction;
+    setContinueButton("", "");
     optionsEl.innerHTML = "";
   }
 
   messageEl.className = "message ok";
 }
 
-function startReview(sourceWords) {
+function startReview(sourceWords, returnMode = "restart") {
   const reviewWords = uniqueWords(sourceWords);
   if (reviewWords.length === 0) {
     initGame();
     return;
   }
 
+  if (!isReviewMode) {
+    pausedMainState = captureMainState();
+  }
+
+  pendingReviewReturnMode = returnMode;
   isReviewMode = true;
   reviewRound += 1;
   deck = shuffle(reviewWords);
@@ -493,6 +672,7 @@ function startReview(sourceWords) {
   usedChoiceSets = [];
   nextBtn.dataset.action = "next";
   nextBtn.textContent = "次の問題";
+  setContinueButton("", "");
   messageEl.textContent = "";
   messageEl.className = "message";
   updateSavedReviewButton();
@@ -601,18 +781,22 @@ function fillBlank(sentence, answer) {
 }
 
 function loadQuestion() {
-  if (questionNumber >= totalQuestions || deck.length === 0) {
+  if (deck.length === 0 || (isReviewMode && questionNumber >= totalQuestions)) {
     if (isReviewMode) {
       finishReviewRound();
-    } else {
-      finishMainRound();
     }
+    return;
+  }
+
+  if (!isReviewMode && questionNumber >= getSessionEndIndex()) {
+    finishSessionRound();
     return;
   }
 
   answered = false;
   nextBtn.dataset.action = "next";
   nextBtn.textContent = "次の問題";
+  setContinueButton("", "");
   current = deck[questionNumber];
   const quizType = getQuizType(current);
   current.quizType = quizType;
@@ -667,8 +851,9 @@ function handleAnswer(btn, selected) {
   const trapNote = current.trap ? ` / メモ: ${current.trap}` : "";
   const contextNote =
     isContextQuestion && contextQuestion.note ? ` / ポイント: ${contextQuestion.note}` : "";
+  const isCorrect = selected === correctValue;
 
-  if (selected === correctValue) {
+  if (isCorrect) {
     score += 10;
     streak += 1;
     if (isReviewMode) {
@@ -696,6 +881,14 @@ function handleAnswer(btn, selected) {
     messageEl.className = "message ng";
   }
 
+  if (!isReviewMode) {
+    sessionResults.push({
+      word: current,
+      correct: isCorrect,
+      quizType: current.quizType,
+    });
+  }
+
   questionNumber += 1;
   updateStatus();
 }
@@ -703,13 +896,28 @@ function handleAnswer(btn, selected) {
 function handleNextAction() {
   const action = nextBtn.dataset.action;
 
+  if (action === "review-pending") {
+    startReview(pendingReviewWords, pendingReviewReturnMode);
+    return;
+  }
+
   if (action === "review") {
     startReview(missedWords);
     return;
   }
 
   if (action === "review-again") {
-    startReview(reviewMisses);
+    startReview(reviewMisses, pendingReviewReturnMode);
+    return;
+  }
+
+  if (action === "continue-session") {
+    startNextSession();
+    return;
+  }
+
+  if (action === "return-review") {
+    returnFromReview();
     return;
   }
 
@@ -721,10 +929,28 @@ function handleNextAction() {
   loadQuestion();
 }
 
+function handleContinueAction() {
+  const action = continueBtn.dataset.action;
+
+  if (action === "continue-session") {
+    startNextSession();
+    return;
+  }
+
+  if (action === "return-review") {
+    returnFromReview();
+    return;
+  }
+
+  if (action === "restart") {
+    initGame();
+  }
+}
+
 function startSavedReview() {
   const savedWords = getSavedWeakWords();
   if (savedWords.length > 0) {
-    startReview(savedWords);
+    startReview(savedWords, "resume-main");
   }
 }
 
@@ -738,6 +964,9 @@ nextBtn.addEventListener("click", handleNextAction);
 resetBtn.addEventListener("click", initGame);
 if (savedReviewBtn) {
   savedReviewBtn.addEventListener("click", startSavedReview);
+}
+if (continueBtn) {
+  continueBtn.addEventListener("click", handleContinueAction);
 }
 
 initGame();

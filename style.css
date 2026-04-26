@@ -195,6 +195,19 @@ button:hover {
   font-weight: 700;
 }
 
+.reflection-list {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.reflection-item.is-correct {
+  border-left: 4px solid #14b8a6;
+}
+
+.reflection-item.is-wrong {
+  border-left: 4px solid #f87171;
+}
+
 @media (max-width: 520px) {
   .prompt {
     font-size: 1.15rem;
